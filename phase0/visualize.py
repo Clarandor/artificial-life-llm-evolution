@@ -8,17 +8,30 @@ Phase 0: Visualization & Observation Metrics
 """
 
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-from sklearn.decomposition import PCA
 from typing import List, Optional
 import os
+
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    HAS_MPL = True
+except ImportError:
+    HAS_MPL = False
+
+try:
+    from sklearn.decomposition import PCA
+    HAS_SKL = True
+except ImportError:
+    HAS_SKL = False
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 
 def plot_fitness_curve(generation_log: List[dict], save: bool = True, show: bool = False):
+    if not HAS_MPL:
+        print("[skip] matplotlib not available — skipping fitness curve plot")
+        return
     """Plot mean/max/min fitness across generations."""
     gens        = [e["generation"]   for e in generation_log]
     mean_fit    = [e["mean_fitness"] for e in generation_log]
@@ -59,6 +72,9 @@ def plot_message_pca(
     save: bool = True,
     show: bool = False,
 ):
+    if not HAS_MPL or not HAS_SKL:
+        print("[skip] matplotlib/sklearn not available — skipping PCA plot")
+        return
     """
     PCA of message vectors sampled at different generations.
     Each point = one agent's message vector; color = generation.
@@ -109,6 +125,9 @@ def plot_message_pca(
 
 
 def plot_message_variance(generation_log: List[dict], save: bool = True, show: bool = False):
+    if not HAS_MPL:
+        print("[skip] matplotlib not available — skipping variance plot")
+        return
     """
     Track how message vector variance changes over generations.
     Rising variance = diverging signals (semantic differentiation).
@@ -143,6 +162,9 @@ def plot_message_variance(generation_log: List[dict], save: bool = True, show: b
 
 def render_grid_snapshot(world, save: bool = True, show: bool = False, tag: str = ""):
     """Render a snapshot of the grid world (food + agent positions)."""
+    if not HAS_MPL:
+        print("[skip] matplotlib not available — skipping grid snapshot")
+        return
     import matplotlib.patches as patches
 
     g = world.grid_size
