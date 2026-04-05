@@ -1,12 +1,13 @@
 """
-Phase 0.2: Visualization — Group Selection + Prey Hunt
-========================================================
+Phase 0.4c: Visualization
+============================
 Plots:
-  1. Fitness curve (composite + prey captures)
+  1. Fitness curve (composite with shaping contribution)
   2. Prey capture emergence
-  3. Tribe competition (tribe avg fitness over time)
-  4. PCA of message vectors
-  5. Message variance evolution
+  3. Reward shaping curve (total shaping + receiver component + decay)
+  4. Tribe competition
+  5. PCA of message vectors
+  6. Message variance evolution
 """
 
 import numpy as np
@@ -31,9 +32,8 @@ RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 
-def plot_fitness_curve(generation_log: List[dict], save=True, show=False):
+def plot_fitness_curve(generation_log: List[dict], save=True):
     if not HAS_MPL:
-        print("[skip] matplotlib not available")
         return
     gens     = [e["generation"]   for e in generation_log]
     mean_fit = [e["mean_fitness"] for e in generation_log]
@@ -41,13 +41,20 @@ def plot_fitness_curve(generation_log: List[dict], save=True, show=False):
     min_fit  = [e["min_fitness"]  for e in generation_log]
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    fig.suptitle("Phase 0.2: Composite Fitness (food + 3×prey)", fontsize=14, fontweight="bold")
+    from .environment import FIXED_ENCODING
+    phase = "0.4c (Fixed Encoding)" if FIXED_ENCODING else "0.4a"
+    fig.suptitle(f"Phase {phase}: Composite Fitness (food + prey + shaped)", fontsize=14, fontweight="bold")
     ax.fill_between(gens, min_fit, max_fit, alpha=0.15, color="steelblue")
     ax.plot(gens, mean_fit, color="steelblue", linewidth=2, label="mean fitness")
     ax.plot(gens, max_fit,  color="darkorange", linewidth=1, linestyle="--", label="max fitness")
+
+    # Mark curriculum phases
+    ax.axvline(x=100, color="green", linestyle=":", alpha=0.6, label="shaping decay start")
+    ax.axvline(x=200, color="red",   linestyle=":", alpha=0.6, label="pure natural selection")
+
     ax.set_xlabel("Generation")
     ax.set_ylabel("Composite Fitness")
-    ax.legend(fontsize=10)
+    ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
     plt.tight_layout()
     if save:
@@ -57,34 +64,30 @@ def plot_fitness_curve(generation_log: List[dict], save=True, show=False):
     plt.close()
 
 
-def plot_prey_captures(generation_log: List[dict], save=True, show=False):
+def plot_prey_captures(generation_log: List[dict], save=True):
     if not HAS_MPL:
         return
     gens = [e["generation"] for e in generation_log]
-    mean_prey = [e.get("mean_prey_cap", 0) for e in generation_log]
-    max_prey  = [e.get("max_prey_cap", 0)  for e in generation_log]
     total_prey = [e.get("total_prey_caps", 0) for e in generation_log]
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
-    fig.suptitle("Phase 0.2: Cooperative Prey Captures", fontsize=14, fontweight="bold")
+    fig, ax = plt.subplots(figsize=(10, 5))
+    from .environment import FIXED_ENCODING
+    phase = "0.4c (Fixed Encoding)" if FIXED_ENCODING else "0.4a"
+    fig.suptitle(f"Phase {phase}: Cooperative Prey Captures", fontsize=14, fontweight="bold")
 
-    ax1.plot(gens, mean_prey, color="purple", linewidth=2, label="mean prey/agent")
-    ax1.plot(gens, max_prey,  color="orchid", linewidth=1, linestyle="--", label="max prey/agent")
-    ax1.set_ylabel("Prey Captures per Agent")
-    ax1.legend(fontsize=10)
-    ax1.grid(alpha=0.3)
-
-    # Rolling average for total
     window = min(20, len(total_prey))
     if window > 1:
         rolling = np.convolve(total_prey, np.ones(window)/window, mode='valid')
-        ax2.plot(gens[:len(rolling)], rolling, color="crimson", linewidth=2, label=f"rolling avg (w={window})")
-    ax2.bar(gens, total_prey, color="salmon", alpha=0.4, label="total captures/gen")
-    ax2.set_xlabel("Generation")
-    ax2.set_ylabel("Total Prey Captures")
-    ax2.legend(fontsize=10)
-    ax2.grid(alpha=0.3)
+        ax.plot(gens[:len(rolling)], rolling, color="crimson", linewidth=2, label=f"rolling avg (w={window})")
+    ax.bar(gens, total_prey, color="salmon", alpha=0.4, label="captures/gen")
 
+    ax.axvline(x=100, color="green", linestyle=":", alpha=0.6)
+    ax.axvline(x=200, color="red",   linestyle=":", alpha=0.6)
+
+    ax.set_xlabel("Generation")
+    ax.set_ylabel("Total Prey Captures")
+    ax.legend(fontsize=10)
+    ax.grid(alpha=0.3)
     plt.tight_layout()
     if save:
         path = os.path.join(RESULTS_DIR, "prey_captures.png")
@@ -93,19 +96,54 @@ def plot_prey_captures(generation_log: List[dict], save=True, show=False):
     plt.close()
 
 
-def plot_tribe_competition(generation_log: List[dict], save=True, show=False):
-    """Plot tribe average fitness over time to show group competition dynamics."""
+def plot_shaping_curve(generation_log: List[dict], save=True):
+    """Show reward shaping score (total + receiver) and curriculum decay."""
     if not HAS_MPL:
         return
 
-    # Collect all tribe IDs
+    gens = [e["generation"] for e in generation_log]
+    mean_shaping = [e.get("mean_shaping", 0) for e in generation_log]
+    mean_receiver = [e.get("mean_receiver", 0) for e in generation_log]
+    decay = [e.get("shaping_decay", 1.0) for e in generation_log]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    from .environment import FIXED_ENCODING
+    phase = "0.4c (Fixed Encoding)" if FIXED_ENCODING else "0.4a"
+    fig.suptitle(f"Phase {phase}: Reward Shaping (Sender + Receiver)", fontsize=14, fontweight="bold")
+
+    # Shaping scores
+    ax1.plot(gens, mean_shaping, color="purple", linewidth=2, label="total shaping (align+approach+recv)")
+    ax1.plot(gens, mean_receiver, color="teal", linewidth=2, linestyle="--", label="receiver component")
+    ax1.set_ylabel("Shaping Score (raw)")
+    ax1.legend(fontsize=9)
+    ax1.grid(alpha=0.3)
+    ax1.axvline(x=100, color="green", linestyle=":", alpha=0.6)
+    ax1.axvline(x=200, color="red",   linestyle=":", alpha=0.6)
+
+    # Decay schedule
+    ax2.fill_between(gens, 0, decay, color="gold", alpha=0.3)
+    ax2.plot(gens, decay, color="darkorange", linewidth=2, label="shaping decay multiplier")
+    ax2.set_xlabel("Generation")
+    ax2.set_ylabel("Decay Multiplier")
+    ax2.set_ylim(-0.05, 1.1)
+    ax2.legend(fontsize=10)
+    ax2.grid(alpha=0.3)
+
+    plt.tight_layout()
+    if save:
+        path = os.path.join(RESULTS_DIR, "shaping_curve.png")
+        plt.savefig(path, dpi=150)
+        print(f"Saved: {path}")
+    plt.close()
+
+
+def plot_tribe_competition(generation_log: List[dict], save=True):
+    if not HAS_MPL:
+        return
     all_tribes = set()
     for entry in generation_log:
-        ta = entry.get("tribe_avg", {})
-        all_tribes.update(ta.keys())
-
+        all_tribes.update(entry.get("tribe_avg", {}).keys())
     if not all_tribes:
-        print("[skip] No tribe data found")
         return
 
     tribe_ids = sorted(all_tribes)
@@ -113,21 +151,24 @@ def plot_tribe_competition(generation_log: List[dict], save=True, show=False):
     colors = plt.cm.tab10(np.linspace(0, 1, len(tribe_ids)))
 
     fig, ax = plt.subplots(figsize=(12, 6))
-    fig.suptitle("Phase 0.2: Tribe Competition (Group Selection)", fontsize=14, fontweight="bold")
+    from .environment import FIXED_ENCODING
+    phase = "0.4c (Fixed Encoding)" if FIXED_ENCODING else "0.4a"
+    fig.suptitle(f"Phase {phase}: Tribe Competition", fontsize=14, fontweight="bold")
 
     for tid, color in zip(tribe_ids, colors):
         vals = [e.get("tribe_avg", {}).get(tid, np.nan) for e in generation_log]
         ax.plot(gens, vals, color=color, linewidth=1.2, alpha=0.7, label=f"Tribe {tid}")
 
-    # Overall mean
     mean_fit = [e["mean_fitness"] for e in generation_log]
-    ax.plot(gens, mean_fit, color="black", linewidth=2.5, linestyle="--", label="Population mean")
+    ax.plot(gens, mean_fit, color="black", linewidth=2.5, linestyle="--", label="Pop mean")
+
+    ax.axvline(x=100, color="green", linestyle=":", alpha=0.6)
+    ax.axvline(x=200, color="red",   linestyle=":", alpha=0.6)
 
     ax.set_xlabel("Generation")
     ax.set_ylabel("Average Fitness")
     ax.legend(fontsize=8, ncol=3, loc="upper left")
     ax.grid(alpha=0.3)
-
     plt.tight_layout()
     if save:
         path = os.path.join(RESULTS_DIR, "tribe_competition.png")
@@ -136,9 +177,8 @@ def plot_tribe_competition(generation_log: List[dict], save=True, show=False):
     plt.close()
 
 
-def plot_message_pca(generation_log: List[dict], save=True, show=False):
+def plot_message_pca(generation_log: List[dict], save=True):
     if not HAS_MPL or not HAS_SKL:
-        print("[skip] matplotlib/sklearn not available")
         return
 
     n = len(generation_log)
@@ -169,6 +209,7 @@ def plot_message_pca(generation_log: List[dict], save=True, show=False):
     ax.set_title("PCA of Agent Messages (4D → 2D)", fontsize=13)
     ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)")
     ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)")
+
     ax.grid(alpha=0.3)
     plt.tight_layout()
     if save:
@@ -178,7 +219,7 @@ def plot_message_pca(generation_log: List[dict], save=True, show=False):
     plt.close()
 
 
-def plot_message_variance(generation_log: List[dict], save=True, show=False):
+def plot_message_variance(generation_log: List[dict], save=True):
     if not HAS_MPL:
         return
 
@@ -197,11 +238,14 @@ def plot_message_variance(generation_log: List[dict], save=True, show=False):
     ax.set_title("Mean Message Variance Over Generations", fontsize=13)
     ax.set_xlabel("Generation")
     ax.set_ylabel("Mean Variance (MSG_DIM=4)")
+
+    ax.axvline(x=100, color="green", linestyle=":", alpha=0.6, label="decay start")
+    ax.axvline(x=200, color="red",   linestyle=":", alpha=0.6, label="pure natural")
+    ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
 
     if len(variances) > 10:
         v = np.array(variances)
-        # Annotate final variance
         ax.annotate(f"final={v[-1]:.4f}", xy=(gens[-1], v[-1]),
                     fontsize=9, ha="right", va="bottom", color="crimson")
     plt.tight_layout()
@@ -216,6 +260,7 @@ def generate_all_plots(generation_log: List[dict], world=None):
     print("\nGenerating plots...")
     plot_fitness_curve(generation_log)
     plot_prey_captures(generation_log)
+    plot_shaping_curve(generation_log)
     plot_tribe_competition(generation_log)
     plot_message_pca(generation_log)
     plot_message_variance(generation_log)
