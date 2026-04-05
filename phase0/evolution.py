@@ -1,14 +1,17 @@
 """
-Phase 0.2: Evolution with Group Selection
-===========================================
-Key mechanism: Tribes compete at the group level.
-  - Population = N_TRIBES × TRIBE_SIZE
-  - Each generation: agents act in shared world
-  - Selection: Two-level:
-      1. Inter-tribe: tribe avg fitness → proportional tribe slots for next gen
-      2. Intra-tribe: tournament selection within each tribe
-  - This creates selection pressure for altruistic signaling:
-      tribes with good communicators → higher tribe fitness → more slots
+Phase 0.4a: Evolution with Receiver Shaping
+==============================================
+Key change from 0.3: shaping_score now includes receiver_score in addition
+to alignment_score + approach_score. This provides selection pressure on
+BOTH the sender (encode signal matching movement) and receiver (decode
+neighbor signal and follow it).
+
+  fitness = raw_food + PREY_BONUS × prey_captures + decay(gen) × shaping_score
+
+Curriculum schedule:
+  gen 0-100:   decay = 1.0 (full shaping)
+  gen 100-200: decay = linear 1.0 → 0.0
+  gen 200+:    decay = 0.0 (pure natural selection)
 """
 
 import numpy as np
@@ -62,34 +65,25 @@ class PopulationBatch:
         messages = tanh(np.einsum('nmi,ni->nm', self.Wm[:N], h2) + self.bm[:N])
         return actions.astype(np.int32), messages
 
-    def get_agent_weights(self, idx: int) -> List[np.ndarray]:
-        return [
-            self.W1[idx], self.b1[idx], self.W2[idx], self.b2[idx],
-            self.Wa[idx], self.ba[idx], self.Wm[idx], self.bm[idx],
-        ]
-
-    def set_agent_weights(self, idx: int, weights: List[np.ndarray]):
-        self.W1[idx], self.b1[idx] = weights[0], weights[1]
-        self.W2[idx], self.b2[idx] = weights[2], weights[3]
-        self.Wa[idx], self.ba[idx] = weights[4], weights[5]
-        self.Wm[idx], self.bm[idx] = weights[6], weights[7]
-
     WEIGHT_ATTRS = ['W1', 'b1', 'W2', 'b2', 'Wa', 'ba', 'Wm', 'bm']
 
 
 class EvolutionEngine:
     """
-    Two-level selection:
-      - Inter-tribe: tribe avg fitness → proportional breeding slots
-      - Intra-tribe: tournament selection within tribe
+    Two-level selection + reward shaping with curriculum decay.
     """
 
     STEPS_PER_GEN    = 200
     TOURNAMENT_K     = 3
     MUTATION_SIGMA_0 = 0.05
     MUTATION_SIGMA_F = 0.01
-    ELITE_PER_TRIBE  = 1        # top 1 in each tribe preserved
-    PREY_BONUS       = 3.0      # extra fitness weight for cooperative captures
+    ELITE_PER_TRIBE  = 1
+    PREY_BONUS       = 3.0
+
+    # Curriculum schedule
+    SHAPING_FULL_UNTIL = 100   # full reward shaping until this gen
+    SHAPING_ZERO_AT    = 200   # shaping fully removed at this gen
+    SHAPING_WEIGHT     = 0.5   # max weight of shaping in fitness
 
     def __init__(
         self,
@@ -103,15 +97,12 @@ class EvolutionEngine:
         self.rng = np.random.default_rng(seed)
         self.generation_log: List[dict] = []
 
-        # Init world
         self.world = GridWorld(grid_size=grid_size, seed=seed)
         self.world.seed_food(density=0.1)
 
-        # Init population batch
         self.batch = PopulationBatch(self.population_size, self.rng)
 
-        # Seed agents with tribe assignments
-        # Tribes start in clustered regions (kin proximity)
+        # Clustered tribe initialization
         tribe_centers = []
         for t in range(N_TRIBES):
             cx = int(self.rng.integers(4, grid_size - 4))
@@ -136,18 +127,31 @@ class EvolutionEngine:
         frac = gen / max(total_gens - 1, 1)
         return self.MUTATION_SIGMA_0 * (1 - frac) + self.MUTATION_SIGMA_F * frac
 
+    def _get_shaping_decay(self, gen: int) -> float:
+        """Curriculum decay: 1.0 → 0.0 over [SHAPING_FULL_UNTIL, SHAPING_ZERO_AT]."""
+        if gen <= self.SHAPING_FULL_UNTIL:
+            return 1.0
+        elif gen >= self.SHAPING_ZERO_AT:
+            return 0.0
+        else:
+            return 1.0 - (gen - self.SHAPING_FULL_UNTIL) / (self.SHAPING_ZERO_AT - self.SHAPING_FULL_UNTIL)
+
     def run(self, generations: int = 300, callback=None):
         pop = self.population_size
         print(f"Starting evolution: {generations} gen × {self.STEPS_PER_GEN} steps")
         print(f"  Population: {pop} ({N_TRIBES} tribes × {TRIBE_SIZE})")
         print(f"  Grid: {self.grid_size}² | Predators: {NUM_PREDATORS} | Prey: {NUM_PREY}")
         print(f"  MSG_DIM={MSG_DIM} | HIDDEN={HIDDEN_DIM} | params≈{MLP().param_count}")
-        print(f"  Selection: 2-level (inter-tribe proportional + intra-tribe tournament)")
-        print(f"  Prey capture bonus: {self.PREY_BONUS}×")
+        print(f"  Selection: 2-level (inter-tribe + intra-tribe tournament)")
+        print(f"  Prey bonus: {self.PREY_BONUS}× | Shaping weight: {self.SHAPING_WEIGHT}")
+        print(f"  Curriculum: full shaping gen 0-{self.SHAPING_FULL_UNTIL}, "
+              f"decay {self.SHAPING_FULL_UNTIL}-{self.SHAPING_ZERO_AT}, "
+              f"pure selection {self.SHAPING_ZERO_AT}+")
         print(f"  Mutation σ: {self.MUTATION_SIGMA_0} → {self.MUTATION_SIGMA_F}\n")
 
         for gen in range(generations):
             t0 = time.time()
+            shaping_decay = self._get_shaping_decay(gen)
 
             for _ in range(self.STEPS_PER_GEN):
                 agents = self.world.agents
@@ -173,7 +177,12 @@ class EvolutionEngine:
             agents = self.world.agents
             raw_food = np.array([a.food_collected for a in agents], dtype=np.float32)
             prey_caps = np.array([a.prey_captured for a in agents], dtype=np.float32)
-            fitnesses = raw_food + self.PREY_BONUS * prey_caps
+            shaping = np.array([a.shaping_score for a in agents], dtype=np.float32)
+
+            # Composite fitness with curriculum-decayed shaping
+            fitnesses = (raw_food
+                        + self.PREY_BONUS * prey_caps
+                        + self.SHAPING_WEIGHT * shaping_decay * shaping)
 
             # Per-tribe stats
             tribe_fitness = {}
@@ -182,20 +191,26 @@ class EvolutionEngine:
             tribe_avg = {t: np.mean(fs) for t, fs in tribe_fitness.items()}
 
             total_prey_caps = int(prey_caps.sum())
+            mean_shaping = float(shaping.mean()) if len(shaping) else 0.0
+            receiver_scores = np.array([a.receiver_score for a in agents], dtype=np.float32)
+            mean_receiver = float(receiver_scores.mean()) if len(receiver_scores) else 0.0
             elapsed = round(time.time() - t0, 2)
 
             log_entry = {
-                "generation":     gen,
-                "population":     len(agents),
-                "mean_fitness":   float(fitnesses.mean()) if len(fitnesses) else 0.0,
-                "max_fitness":    float(fitnesses.max())  if len(fitnesses) else 0.0,
-                "min_fitness":    float(fitnesses.min())  if len(fitnesses) else 0.0,
-                "mean_raw_food":  float(raw_food.mean())  if len(raw_food)  else 0.0,
-                "mean_prey_cap":  float(prey_caps.mean()) if len(prey_caps) else 0.0,
-                "max_prey_cap":   float(prey_caps.max())  if len(prey_caps) else 0.0,
+                "generation":      gen,
+                "population":      len(agents),
+                "mean_fitness":    float(fitnesses.mean()) if len(fitnesses) else 0.0,
+                "max_fitness":     float(fitnesses.max())  if len(fitnesses) else 0.0,
+                "min_fitness":     float(fitnesses.min())  if len(fitnesses) else 0.0,
+                "mean_raw_food":   float(raw_food.mean())  if len(raw_food)  else 0.0,
+                "mean_prey_cap":   float(prey_caps.mean()) if len(prey_caps) else 0.0,
+                "max_prey_cap":    float(prey_caps.max())  if len(prey_caps) else 0.0,
                 "total_prey_caps": total_prey_caps,
-                "tribe_avg":      tribe_avg,
-                "elapsed_sec":    elapsed,
+                "mean_shaping":    mean_shaping,
+                "mean_receiver":   mean_receiver,
+                "shaping_decay":   shaping_decay,
+                "tribe_avg":       tribe_avg,
+                "elapsed_sec":     elapsed,
                 "sample_messages": np.stack([a.last_message for a in agents[:20]]) if agents else None,
             }
             self.generation_log.append(log_entry)
@@ -203,18 +218,22 @@ class EvolutionEngine:
             if self.verbose and (gen % 10 == 0 or gen < 5):
                 sigma = self._get_sigma(gen, generations)
                 best_tribe = max(tribe_avg, key=tribe_avg.get) if tribe_avg else -1
+                phase = ("SHAPING" if shaping_decay > 0.99
+                         else f"DECAY({shaping_decay:.2f})" if shaping_decay > 0.01
+                         else "NATURAL")
                 print(
-                    f"Gen {gen:4d} | pop={log_entry['population']:4d} | "
-                    f"fit μ={log_entry['mean_fitness']:.2f} max={log_entry['max_fitness']:.1f} | "
-                    f"prey μ={log_entry['mean_prey_cap']:.2f} tot={total_prey_caps} | "
-                    f"best tribe={best_tribe}({tribe_avg.get(best_tribe,0):.1f}) | "
+                    f"Gen {gen:4d} [{phase:12s}] | pop={log_entry['population']:4d} | "
+                    f"fit μ={log_entry['mean_fitness']:.2f} | "
+                    f"prey tot={total_prey_caps:3d} | "
+                    f"shaping μ={mean_shaping:.1f} recv={mean_receiver:.1f} | "
+                    f"tribe★={best_tribe}({tribe_avg.get(best_tribe,0):.1f}) | "
                     f"σ={sigma:.4f} | ⏱ {elapsed}s"
                 )
 
             if callback:
                 callback(gen, log_entry)
 
-            # ── Two-level breed ────────────────────────────────────────────────
+            # ── Breed ──────────────────────────────────────────────────────────
             self._breed_group_selection(agents, fitnesses, gen, generations)
 
         print("\nEvolution complete.")
@@ -223,51 +242,39 @@ class EvolutionEngine:
     def _breed_group_selection(
         self, agents: List[Agent], fitnesses: np.ndarray, gen: int, total_gens: int
     ):
-        """
-        Two-level selection:
-          1. Inter-tribe: allocate slots proportional to tribe avg fitness
-          2. Intra-tribe: tournament + elitism within each tribe
-        """
         sigma = self._get_sigma(gen, total_gens)
 
-        # Group agents by tribe
-        tribe_agents = {}   # tribe_id -> list of (agent_idx_in_world, fitness)
+        tribe_agents = {}
         for i, (agent, fit) in enumerate(zip(agents, fitnesses)):
             tribe_agents.setdefault(agent.tribe_id, []).append((i, fit))
 
-        # Tribe average fitness
         tribe_ids = sorted(tribe_agents.keys())
         if not tribe_ids:
             return
 
         tribe_avg_fit = np.array([np.mean([f for _, f in tribe_agents[t]]) for t in tribe_ids])
-        # Shift to positive
         shifted = tribe_avg_fit - tribe_avg_fit.min() + 1.0
         tribe_probs = shifted / shifted.sum()
 
-        # Allocate slots proportionally (total = self.population_size)
         raw_slots = tribe_probs * self.population_size
         tribe_slots = np.round(raw_slots).astype(int)
-        # Adjust to hit exact total
         diff = self.population_size - tribe_slots.sum()
         if diff > 0:
             for _ in range(diff):
                 tribe_slots[np.argmax(tribe_probs)] += 1
         elif diff < 0:
             for _ in range(-diff):
-                tribe_slots[np.argmin(tribe_slots)] = max(1, tribe_slots[np.argmin(tribe_slots)] - 1)
+                idx = np.argmin(tribe_slots)
+                tribe_slots[idx] = max(1, tribe_slots[idx] - 1)
 
-        # Stash old weights
         old_weights = {}
         for attr in PopulationBatch.WEIGHT_ATTRS:
             n = len(agents)
             old_weights[attr] = getattr(self.batch, attr)[:n].copy()
 
-        # Build new population
         new_slot = 0
         new_agents = []
 
-        # Tribe center tracking for kin clustering
         tribe_centers = {}
         for t_idx, tid in enumerate(tribe_ids):
             members = tribe_agents[tid]
@@ -284,7 +291,6 @@ class EvolutionEngine:
             if len(members) == 0:
                 continue
 
-            # Elite: best in tribe
             elite_count = min(self.ELITE_PER_TRIBE, slots, len(members))
             sorted_local = np.argsort(member_fits)[::-1]
 
@@ -306,7 +312,6 @@ class EvolutionEngine:
                 self.world._next_agent_id += 1
                 new_slot += 1
 
-            # Children via tournament
             for _ in range(slots - elite_count):
                 if new_slot >= self.batch.pop_size:
                     self._grow_batch(new_slot + 1)
@@ -332,11 +337,9 @@ class EvolutionEngine:
                 self.world._next_agent_id += 1
                 new_slot += 1
 
-        # Reset world
         self.world.agents = new_agents
         self.world.grid[:] = 0.0
         self.world.seed_food(density=0.1)
-        # Respawn prey at new locations
         for prey in self.world.prey_list:
             prey.respawn(self.grid_size, self.rng)
 
