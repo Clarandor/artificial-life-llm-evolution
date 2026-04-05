@@ -1,13 +1,18 @@
 """
-Phase 0.2: Grid World — Kin Selection + Prey Hunt + Group Selection
-====================================================================
-Key changes:
-  - Tribes: population split into N_TRIBES groups; group selection pressure
-  - Prey: mobile high-value targets requiring 2+ agents to capture
-  - Predators: faster (speed=2), maintain survival pressure
-  - Agents get tribe_id for group-level selection
-  - New action: 5 = attack (attempt prey capture)
-  - Kin selection: children stay near parents (already ±2), tribe ensures kin proximity
+Phase 0.4c: Grid World — Fixed Encoding Diagnostic
+======================================================
+Diagnostic experiment: messages are FIXED (hard-coded to nearest prey
+direction) rather than evolved. Only the decoder (receiver weights) is
+subject to evolution. This measures the upper bound of GA's ability to
+evolve signal utilization.
+
+When FIXED_ENCODING=True:
+  - msg[:2] is overwritten with the normalized direction to nearest prey
+  - Sender alignment shaping is skipped (encoding is perfect by design)
+  - Receiver shaping + approach reward remain active
+  - Curriculum decay still applies
+
+When FIXED_ENCODING=False: behaves like Phase 0.4a.
 """
 
 import numpy as np
@@ -18,7 +23,7 @@ from typing import List, Tuple, Optional
 # ── Constants ──────────────────────────────────────────────────────────────────
 GRID_SIZE = 32
 FOOD_ENERGY = 20.0
-PREY_CAPTURE_ENERGY = 80.0        # huge reward for cooperative hunt
+PREY_CAPTURE_ENERGY = 80.0
 STEP_ENERGY_COST = 1.0
 REPRODUCTION_THRESHOLD = 80.0
 REPRODUCTION_COST = 40.0
@@ -27,16 +32,24 @@ FOOD_SPAWN_RATE = 0.02
 MAX_AGENTS = 500
 MIN_AGENTS = 10
 MSG_DIM = 4
-OBS_DIM = 16                      # expanded for prey info + tribe signal
+OBS_DIM = 16
 ACTION_DIM = 6                    # 0-3 move, 4 collect, 5 attack
 
 NUM_PREDATORS = 3
-PREDATOR_SPEED = 2                # faster predators
+PREDATOR_SPEED = 2
 NUM_PREY = 5
 PREY_SPEED = 1
 
 N_TRIBES = 10
-TRIBE_SIZE = 10                   # initial agents per tribe
+TRIBE_SIZE = 10
+
+# Reward shaping constants
+ALIGN_REWARD = 0.5        # max bonus per step for signal-action alignment
+APPROACH_REWARD = 0.3     # bonus per step for moving toward prey
+RECEIVER_REWARD = 0.4     # bonus per step for following neighbor signal direction
+
+# Diagnostic mode: fixed encoding
+FIXED_ENCODING = True     # True = msg[:2] hardcoded to prey direction (Phase 0.4c)
 
 
 @dataclass
@@ -49,14 +62,18 @@ class Agent:
     tribe_id: int = 0
     age: int = 0
     food_collected: int = 0
-    prey_captured: int = 0        # cooperative kills
+    prey_captured: int = 0
     alive: bool = True
     last_message: np.ndarray = field(default_factory=lambda: np.zeros(MSG_DIM))
+    # Reward shaping accumulators
+    shaping_score: float = 0.0    # accumulated shaping bonus this generation
+    alignment_score: float = 0.0  # signal-action alignment accumulator
+    approach_score: float = 0.0   # prey-approach accumulator
+    receiver_score: float = 0.0   # neighbor-signal following accumulator
 
 
 @dataclass
 class Predator:
-    """Lethal NPC that kills agents on contact."""
     x: int
     y: int
 
@@ -69,7 +86,6 @@ class Predator:
 
 @dataclass
 class Prey:
-    """High-value mobile target. Requires 2+ agents attacking simultaneously to capture."""
     x: int
     y: int
     alive: bool = True
@@ -86,11 +102,6 @@ class Prey:
 
 
 class GridWorld:
-    """
-    2D grid with food, prey (cooperative hunt), and predators.
-    Grid cells: 0=empty, 1=food
-    """
-
     def __init__(
         self,
         grid_size: int = GRID_SIZE,
@@ -112,21 +123,17 @@ class GridWorld:
         self.step_count = 0
         self._next_agent_id = 0
 
-        # Spawn predators
         for _ in range(num_predators):
             self.predators.append(Predator(
                 x=int(self.rng.integers(0, grid_size)),
                 y=int(self.rng.integers(0, grid_size)),
             ))
-
-        # Spawn prey
         for _ in range(num_prey):
             self.prey_list.append(Prey(
                 x=int(self.rng.integers(0, grid_size)),
                 y=int(self.rng.integers(0, grid_size)),
             ))
 
-        # Metrics
         self.history_fitness: List[float] = []
         self.history_population: List[int] = []
         self.history_messages: List[np.ndarray] = []
@@ -148,65 +155,152 @@ class GridWorld:
 
         prey_captures_this_step = 0
         kills_this_step = 0
+        g = self.grid_size
+        half_g = g / 2.0
 
-        # 1. Store outgoing messages
-        for agent, msg in zip(self.agents, messages):
-            agent.last_message = msg.copy()
+        # Record pre-move positions for reward shaping
+        pre_x = [a.x for a in self.agents]
+        pre_y = [a.y for a in self.agents]
 
-        # 2. Move agents (actions 0-3), collect (4), attack (5)
-        deltas = [(-1,0),(1,0),(0,-1),(0,1),(0,0),(0,0)]  # 5=attack=stay
+        # 0. Build neighbor message map BEFORE this step's messages overwrite
+        #    This captures what each agent "heard" from neighbors last step
+        neighbor_avg_msg = self._compute_neighbor_avg_msg()
+
+        # 1. Store outgoing messages (with optional fixed encoding)
+        if FIXED_ENCODING and self.prey_list:
+            prey_pos = np.array([[p.x, p.y] for p in self.prey_list if p.alive],
+                                dtype=np.float32)
+            if len(prey_pos) == 0:
+                prey_pos = np.array([[p.x, p.y] for p in self.prey_list],
+                                    dtype=np.float32)
+            for agent, msg in zip(self.agents, messages):
+                # Compute direction to nearest prey (toroidal)
+                dx = prey_pos[:, 0] - agent.x
+                dy = prey_pos[:, 1] - agent.y
+                dx = np.where(np.abs(dx) > half_g, dx - np.sign(dx) * g, dx)
+                dy = np.where(np.abs(dy) > half_g, dy - np.sign(dy) * g, dy)
+                dists = np.abs(dx) + np.abs(dy)
+                nearest = np.argmin(dists)
+                direction = np.array([dx[nearest], dy[nearest]], dtype=np.float32)
+                norm = np.linalg.norm(direction)
+                if norm > 0:
+                    direction /= norm
+                # Override msg[:2] with true prey direction; keep msg[2:] from MLP
+                fixed_msg = msg.copy()
+                fixed_msg[:2] = direction
+                agent.last_message = fixed_msg
+        else:
+            for agent, msg in zip(self.agents, messages):
+                agent.last_message = msg.copy()
+
+        # 2. Move agents
+        deltas = [(-1,0),(1,0),(0,-1),(0,1),(0,0),(0,0)]
         for agent, action in zip(self.agents, actions):
             a = min(action, 5)
             dx, dy = deltas[a]
-            agent.x = (agent.x + dx) % self.grid_size
-            agent.y = (agent.y + dy) % self.grid_size
+            agent.x = (agent.x + dx) % g
+            agent.y = (agent.y + dy) % g
             agent.energy -= STEP_ENERGY_COST
             agent.age += 1
 
-        # 3. Collect food (action==4)
+        # 3. Reward Shaping: Signal-Action Alignment
+        # Skip when FIXED_ENCODING — sender is already perfect by design
+        if not FIXED_ENCODING:
+            action_dirs = np.array([[-1,0],[1,0],[0,-1],[0,1]], dtype=np.float32)
+            for i, (agent, action, msg) in enumerate(zip(self.agents, actions, messages)):
+                if action < 4:  # only for move actions
+                    sig = msg[:2]
+                    sig_norm = np.linalg.norm(sig)
+                    if sig_norm > 0.1:
+                        sig_unit = sig / sig_norm
+                        act_dir = action_dirs[action]
+                        alignment = float(np.dot(sig_unit, act_dir))
+                        if alignment > 0:
+                            agent.alignment_score += alignment * ALIGN_REWARD
+
+        # 4. Reward Shaping: Approach Prey
+        # Check if agent moved closer to nearest prey
+        if self.prey_list:
+            prey_pos = np.array([[p.x, p.y] for p in self.prey_list], dtype=np.float32)
+            for i, agent in enumerate(self.agents):
+                if not agent.alive:
+                    continue
+                # Distance before move
+                ox, oy = pre_x[i], pre_y[i]
+                dx_pre = prey_pos[:, 0] - ox
+                dy_pre = prey_pos[:, 1] - oy
+                dx_pre = np.where(np.abs(dx_pre) > half_g, dx_pre - np.sign(dx_pre)*g, dx_pre)
+                dy_pre = np.where(np.abs(dy_pre) > half_g, dy_pre - np.sign(dy_pre)*g, dy_pre)
+                dist_pre = np.min(np.abs(dx_pre) + np.abs(dy_pre))
+
+                # Distance after move
+                dx_post = prey_pos[:, 0] - agent.x
+                dy_post = prey_pos[:, 1] - agent.y
+                dx_post = np.where(np.abs(dx_post) > half_g, dx_post - np.sign(dx_post)*g, dx_post)
+                dy_post = np.where(np.abs(dy_post) > half_g, dy_post - np.sign(dy_post)*g, dy_post)
+                dist_post = np.min(np.abs(dx_post) + np.abs(dy_post))
+
+                if dist_post < dist_pre:
+                    # Bonus scales with proximity (closer = more reward)
+                    prox_factor = max(0, 1.0 - dist_post / half_g)
+                    agent.approach_score += APPROACH_REWARD * prox_factor
+
+        # 4b. Reward Shaping: Receiver — follow neighbor signal direction
+        # If agent receives neighbor msg[:2] pointing in a direction and agent moves
+        # that way, it gets a receiver bonus.
+        action_dirs_recv = np.array([[-1,0],[1,0],[0,-1],[0,1]], dtype=np.float32)
+        for i, (agent, action) in enumerate(zip(self.agents, actions)):
+            if action < 4 and agent.alive:  # only for move actions
+                recv_msg = neighbor_avg_msg[i]  # average msg from neighbors
+                sig = recv_msg[:2]
+                sig_norm = np.linalg.norm(sig)
+                if sig_norm > 0.1:  # neighbors sent meaningful signal
+                    sig_unit = sig / sig_norm
+                    act_dir = action_dirs_recv[action]
+                    alignment = float(np.dot(sig_unit, act_dir))
+                    if alignment > 0:
+                        agent.receiver_score += alignment * RECEIVER_REWARD
+
+        # 5. Collect food (action==4)
         for agent, action in zip(self.agents, actions):
             if action == 4 and self.grid[agent.x, agent.y] == 1.0:
                 agent.energy += FOOD_ENERGY
                 agent.food_collected += 1
                 self.grid[agent.x, agent.y] = 0.0
 
-        # 4. Prey capture (action==5): need ≥2 attackers within 1 cell of prey
+        # 6. Prey capture (action==5): need ≥2 attackers within 1 cell
         for prey in self.prey_list:
             if not prey.alive:
                 continue
-            # Find agents attacking near this prey
             attackers = []
             for agent, action in zip(self.agents, actions):
                 if action == 5 and agent.alive:
-                    dist = abs(agent.x - prey.x) + abs(agent.y - prey.y)
-                    # Handle toroidal wrapping
                     dx = abs(agent.x - prey.x)
                     dy = abs(agent.y - prey.y)
-                    dx = min(dx, self.grid_size - dx)
-                    dy = min(dy, self.grid_size - dy)
-                    if dx + dy <= 1:  # adjacent or same cell
+                    dx = min(dx, g - dx)
+                    dy = min(dy, g - dy)
+                    if dx + dy <= 1:
                         attackers.append(agent)
             if len(attackers) >= 2:
-                # Successful cooperative hunt!
                 for a in attackers:
                     a.energy += PREY_CAPTURE_ENERGY
                     a.prey_captured += 1
-                    a.food_collected += 1  # also counts toward base fitness
+                    a.food_collected += 1
                 prey.alive = False
                 prey_captures_this_step += 1
 
         # Respawn dead prey
         for prey in self.prey_list:
             if not prey.alive:
-                prey.respawn(self.grid_size, self.rng)
+                prey.respawn(g, self.rng)
 
-        # 5. Move prey (alive ones)
+        # 7. Move prey
         for prey in self.prey_list:
-            prey.move(self.grid_size, self.rng)
+            prey.move(g, self.rng)
 
-        # 6. Move predators & kill agents
+        # 8. Move predators & kill
         for pred in self.predators:
-            pred.move(self.grid_size, self.rng)
+            pred.move(g, self.rng)
 
         for agent in self.agents:
             if not agent.alive:
@@ -218,12 +312,12 @@ class GridWorld:
                     kills_this_step += 1
                     break
 
-        # 7. Kill agents with no energy
+        # 9. Kill agents with no energy
         for agent in self.agents:
             if agent.energy <= 0:
                 agent.alive = False
 
-        # 8. Reproduce (children inherit tribe_id, stay near parent)
+        # 10. Reproduce
         new_agents = []
         for agent in self.agents:
             if agent.alive and agent.energy >= REPRODUCTION_THRESHOLD:
@@ -233,17 +327,20 @@ class GridWorld:
                     agent.energy -= REPRODUCTION_COST
 
         self.agents = [a for a in self.agents if a.alive] + new_agents
-
         if len(self.agents) < MIN_AGENTS:
             self._emergency_respawn()
 
-        # 9. Spawn food
+        # 11. Spawn food
         self._spawn_food()
 
-        # 10. Build observations
+        # 12. Update shaping scores
+        for agent in self.agents:
+            agent.shaping_score = agent.alignment_score + agent.approach_score + agent.receiver_score
+
+        # 13. Build observations
         observations = self._build_observations()
 
-        # 11. Record metrics
+        # 14. Record metrics
         if self.agents:
             fitness = np.mean([a.food_collected for a in self.agents])
         else:
@@ -262,28 +359,13 @@ class GridWorld:
     # ── Observation (vectorized) ───────────────────────────────────────────────
 
     def _build_observations(self) -> List[np.ndarray]:
-        """
-        OBS_DIM = 16:
-            [0-4]   food here/N/S/W/E (normalized)
-            [5]     energy (normalized)
-            [6]     neighbor count (Moore)
-            [7-8]   nearest predator dx, dy
-            [9]     nearest predator proximity
-            [10-11] nearest prey dx, dy
-            [12]    nearest prey proximity
-            [13]    tribe-mate density nearby (same-tribe neighbors / all neighbors)
-            [14]    num agents at same cell
-            [15]    placeholder
-
-        Plus MSG_DIM=4 → total input = 20
-        """
+        """OBS_DIM=16 + MSG_DIM=4 → 20 dims total."""
         g = self.grid_size
         half_g = g / 2.0
         N = len(self.agents)
         if N == 0:
             return []
 
-        # Spatial maps
         msg_map = np.zeros((g, g, MSG_DIM), dtype=np.float32)
         count_map = np.zeros((g, g), dtype=np.float32)
         for agent in self.agents:
@@ -292,23 +374,16 @@ class GridWorld:
         nonzero = count_map > 0
         msg_map[nonzero] /= count_map[nonzero, np.newaxis]
 
-        # Neighbor count (Moore neighborhood via rolled count_map)
         neighbor_count_map = np.zeros((g, g), dtype=np.float32)
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                if dx == 0 and dy == 0:
-                    continue
-                neighbor_count_map += np.roll(np.roll(count_map, -dx, axis=0), -dy, axis=1)
-
-        # Neighbor message map
         neighbor_msg_sum = np.zeros((g, g, MSG_DIM), dtype=np.float32)
         neighbor_msg_cnt = np.zeros((g, g), dtype=np.float32)
         for dx in [-1, 0, 1]:
             for dy in [-1, 0, 1]:
                 if dx == 0 and dy == 0:
                     continue
-                rolled_msg = np.roll(np.roll(msg_map, -dx, axis=0), -dy, axis=1)
                 rolled_cnt = np.roll(np.roll(count_map, -dx, axis=0), -dy, axis=1)
+                neighbor_count_map += rolled_cnt
+                rolled_msg = np.roll(np.roll(msg_map, -dx, axis=0), -dy, axis=1)
                 has = rolled_cnt > 0
                 neighbor_msg_sum[has] += rolled_msg[has]
                 neighbor_msg_cnt += has.astype(np.float32)
@@ -316,13 +391,10 @@ class GridWorld:
         neighbor_msg_map = np.zeros((g, g, MSG_DIM), dtype=np.float32)
         neighbor_msg_map[nz2] = neighbor_msg_sum[nz2] / neighbor_msg_cnt[nz2, np.newaxis]
 
-        # Agent arrays
         ax = np.array([a.x for a in self.agents], dtype=np.int32)
         ay = np.array([a.y for a in self.agents], dtype=np.int32)
         energies = np.array([a.energy for a in self.agents], dtype=np.float32)
-        tribe_ids = np.array([a.tribe_id for a in self.agents], dtype=np.int32)
 
-        # Food sensing
         food_here  = self.grid[ax, ay]
         food_north = self.grid[(ax-1)%g, ay]
         food_south = self.grid[(ax+1)%g, ay]
@@ -331,7 +403,6 @@ class GridWorld:
         energy_norm = np.clip(energies / REPRODUCTION_THRESHOLD, 0.0, 2.0)
         n_neighbors_norm = np.clip(neighbor_count_map[ax, ay] / 8.0, 0.0, 1.0)
 
-        # Predator sensing (vectorized)
         if self.predators:
             pred_pos = np.array([[p.x, p.y] for p in self.predators], dtype=np.float32)
             dxs = pred_pos[np.newaxis, :, 0] - ax[:, np.newaxis].astype(np.float32)
@@ -348,7 +419,6 @@ class GridWorld:
             pred_dy = np.zeros(N, dtype=np.float32)
             pred_prox = np.zeros(N, dtype=np.float32)
 
-        # Prey sensing (vectorized)
         if self.prey_list:
             prey_pos = np.array([[p.x, p.y] for p in self.prey_list], dtype=np.float32)
             dxs_pr = prey_pos[np.newaxis, :, 0] - ax[:, np.newaxis].astype(np.float32)
@@ -365,18 +435,16 @@ class GridWorld:
             prey_dy = np.zeros(N, dtype=np.float32)
             prey_prox = np.zeros(N, dtype=np.float32)
 
-        # Tribe-mate density: fraction of neighbors that share tribe_id
-        # Build per-tribe count maps
+        # Tribe-mate density
         tribe_count_maps = np.zeros((N_TRIBES, g, g), dtype=np.float32)
         for agent in self.agents:
             tribe_count_maps[agent.tribe_id, agent.x, agent.y] += 1
 
-        # For each agent: same-tribe neighbors / total neighbors
         tribe_mate_density = np.zeros(N, dtype=np.float32)
         for i, agent in enumerate(self.agents):
             x, y = agent.x, agent.y
-            total_n = 0
-            tribe_n = 0
+            total_n = 0.0
+            tribe_n = 0.0
             for ddx in [-1, 0, 1]:
                 for ddy in [-1, 0, 1]:
                     if ddx == 0 and ddy == 0:
@@ -389,7 +457,6 @@ class GridWorld:
 
         same_cell = count_map[ax, ay] / 4.0
 
-        # Stack
         obs_core = np.stack([
             food_here, food_north, food_south, food_west, food_east,
             energy_norm, n_neighbors_norm,
@@ -398,14 +465,52 @@ class GridWorld:
             tribe_mate_density,
             same_cell,
             np.zeros(N, dtype=np.float32),
-        ], axis=1)  # (N, 16)
+        ], axis=1)
 
-        n_msg = neighbor_msg_map[ax, ay]  # (N, MSG_DIM)
-        obs_all = np.concatenate([obs_core, n_msg], axis=1)  # (N, 20)
-
+        n_msg = neighbor_msg_map[ax, ay]
+        obs_all = np.concatenate([obs_core, n_msg], axis=1)
         return [obs_all[i] for i in range(N)]
 
     # ── Helpers ────────────────────────────────────────────────────────────────
+
+    def _compute_neighbor_avg_msg(self) -> np.ndarray:
+        """Compute average neighbor message for each agent (from last_message).
+        Returns array of shape (N, MSG_DIM)."""
+        g = self.grid_size
+        N = len(self.agents)
+        if N == 0:
+            return np.zeros((0, MSG_DIM), dtype=np.float32)
+
+        # Build message map from current last_message
+        msg_map = np.zeros((g, g, MSG_DIM), dtype=np.float32)
+        count_map = np.zeros((g, g), dtype=np.float32)
+        for agent in self.agents:
+            msg_map[agent.x, agent.y] += agent.last_message
+            count_map[agent.x, agent.y] += 1
+        nonzero = count_map > 0
+        msg_map[nonzero] /= count_map[nonzero, np.newaxis]
+
+        # Sum neighbor messages (8-connected)
+        neighbor_msg_sum = np.zeros((g, g, MSG_DIM), dtype=np.float32)
+        neighbor_msg_cnt = np.zeros((g, g), dtype=np.float32)
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                if dx == 0 and dy == 0:
+                    continue
+                rolled_cnt = np.roll(np.roll(count_map, -dx, axis=0), -dy, axis=1)
+                rolled_msg = np.roll(np.roll(msg_map, -dx, axis=0), -dy, axis=1)
+                has = rolled_cnt > 0
+                neighbor_msg_sum[has] += rolled_msg[has]
+                neighbor_msg_cnt += has.astype(np.float32)
+
+        nz = neighbor_msg_cnt > 0
+        neighbor_avg = np.zeros((g, g, MSG_DIM), dtype=np.float32)
+        neighbor_avg[nz] = neighbor_msg_sum[nz] / neighbor_msg_cnt[nz, np.newaxis]
+
+        # Gather per-agent
+        ax = np.array([a.x for a in self.agents], dtype=np.int32)
+        ay = np.array([a.y for a in self.agents], dtype=np.int32)
+        return neighbor_avg[ax, ay]
 
     def _reproduce(self, parent: Agent) -> Agent:
         child_weights = [
@@ -418,7 +523,7 @@ class GridWorld:
             y=(parent.y + self.rng.integers(-2, 3)) % self.grid_size,
             energy=REPRODUCTION_COST,
             weights=child_weights,
-            tribe_id=parent.tribe_id,   # inherit tribe
+            tribe_id=parent.tribe_id,
         )
         self._next_agent_id += 1
         return child
@@ -454,4 +559,6 @@ class GridWorld:
             "mean_energy": float(np.mean([a.energy for a in self.agents])) if self.agents else 0.0,
             "mean_fitness": float(np.mean([a.food_collected for a in self.agents])) if self.agents else 0.0,
             "mean_prey_cap": float(np.mean([a.prey_captured for a in self.agents])) if self.agents else 0.0,
+            "mean_shaping": float(np.mean([a.shaping_score for a in self.agents])) if self.agents else 0.0,
+            "mean_receiver": float(np.mean([a.receiver_score for a in self.agents])) if self.agents else 0.0,
         }
