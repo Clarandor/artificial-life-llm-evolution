@@ -131,6 +131,7 @@ class HybridEvolutionEngine:
     RL_GAMMA         = 0.99     # discount factor
     RL_GRAD_CLIP     = 0.5      # gradient clipping norm (tighter)
     RL_ENTROPY_BONUS = 0.005    # entropy regularization
+    RL_LR_0          = 0.005    # initial learning rate
     SURVIVAL_REWARD  = 0.01     # small reward per step for being alive
 
     def __init__(
@@ -304,7 +305,7 @@ class HybridEvolutionEngine:
 
             # ── REINFORCE update ──
             rl_lr = self._get_rl_lr(gen, generations)
-            mean_grad_norm = self._reinforce_update(len(agents), rl_lr)
+            mean_grad_norm, diag = self._reinforce_update(len(agents), rl_lr)
 
             elapsed = round(time.time() - t0, 2)
 
@@ -321,6 +322,10 @@ class HybridEvolutionEngine:
                 "mean_attn_entropy": mean_attn_entropy,
                 "mean_grad_norm":   mean_grad_norm,
                 "rl_lr":            rl_lr,
+                "diag_adv_mean":    diag.get('adv_mean', 0),
+                "diag_adv_std":     diag.get('adv_std', 0),
+                "diag_buf_len":     diag.get('buf_len', 0),
+                "diag_skip_zero":   diag.get('skip_zero_std', 0),
                 "tribe_avg":        tribe_avg,
                 "elapsed_sec":      elapsed,
                 "sample_hiddens":   np.stack([a.hidden for a in agents[:20]]) if agents else None,
@@ -348,18 +353,24 @@ class HybridEvolutionEngine:
         print("\nEvolution complete.")
         return self.generation_log
 
-    def _reinforce_update(self, N: int, lr: float) -> float:
+    def _reinforce_update(self, N: int, lr: float) -> tuple:
         """
         Apply REINFORCE gradient to W_q and W_k for each agent slot.
         Uses proper sampled action from attention distribution.
+        Returns: (mean_grad_norm, diagnostic_dict)
         """
         grad_norms = []
+        adv_means = []
+        adv_stds = []
+        buf_lens = []
+        skip_zero_count = 0
 
-        for i in range(N):
+        for i in range(min(N, len(self.rl_buffers))):
             buf = self.rl_buffers[i]
             if len(buf) < 10:  # need minimum trajectory
                 continue
 
+            buf_lens.append(len(buf))
             T = len(buf)
             rewards = np.array([t.reward for t in buf], dtype=np.float32)
 
@@ -376,9 +387,13 @@ class HybridEvolutionEngine:
 
             # Normalize advantages
             std = advantages.std()
+            adv_means.append(float(advantages.mean()))
+            adv_stds.append(float(std))
+            
             if std > 1e-6:
                 advantages = advantages / std
             else:
+                skip_zero_count += 1
                 continue  # no signal if all returns are identical
 
             # Accumulate gradients
@@ -436,7 +451,13 @@ class HybridEvolutionEngine:
             self.batch.W_q[i] += lr * grad_Wq
             self.batch.W_k[i] += lr * grad_Wk
 
-        return float(np.mean(grad_norms)) if grad_norms else 0.0
+        diag = {
+            'adv_mean': float(np.mean(adv_means)) if adv_means else 0.0,
+            'adv_std': float(np.mean(adv_stds)) if adv_stds else 0.0,
+            'buf_len': float(np.mean(buf_lens)) if buf_lens else 0.0,
+            'skip_zero_std': skip_zero_count,
+        }
+        return (float(np.mean(grad_norms)) if grad_norms else 0.0, diag)
 
     def _breed_group_selection(
         self, agents: List[Agent], fitnesses: np.ndarray, gen: int, total_gens: int
