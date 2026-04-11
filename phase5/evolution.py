@@ -346,7 +346,7 @@ class Evolution:
             if attacks.sum() > 0:
                 coord_quality = large_caps.sum() / (attacks.sum() + 1e-10)
 
-            sample_h = np.stack([a.h for a in alive[:50]]) if alive else None
+            sample_h = np.stack([a.h for a in alive[:20]]).tolist() if (alive and gen % 10 == 0) else None
 
             log = {
                 "generation": gen,
@@ -366,7 +366,7 @@ class Evolution:
                 "mean_attn_entropy": mean_attn_entropy,
                 "mean_attn_loss": mean_attn_loss,
                 "elapsed_sec": round(time.time() - t0, 2),
-                "sample_hiddens": sample_h.tolist() if sample_h is not None else None,
+                "sample_hiddens": sample_h if sample_h is not None else None,
             }
             self.generation_log.append(log)
 
@@ -378,7 +378,8 @@ class Evolution:
                     f"fit={fitnesses.mean():.2f} raw={raw_fit.mean():.2f} | "
                     f"large={total_large:2d} small={total_small:2d} | "
                     f"H={mean_attn_entropy:.3f} CQ={coord_quality:.3f} | "
-                    f"sig_sent={sig_sent.mean():.1f} | ⏱ {elapsed:.0f}s"
+                    f"sig_sent={sig_sent.mean():.1f} | ⏱ {elapsed:.0f}s",
+                    flush=True
                 )
 
             # ── Breed next generation ────────────────────────────────────
