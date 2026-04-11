@@ -180,7 +180,8 @@ class Evolution:
             tribe_f = np.array([m[1] for m in members], dtype=np.float32)
 
             for _ in range(len(tribe_a)):
-                idxs = self.rng.choice(len(tribe_a), self.TOURNAMENT_K, replace=False)
+                k = min(self.TOURNAMENT_K, len(tribe_a))
+                idxs = self.rng.choice(len(tribe_a), k, replace=False)
                 best = max(idxs, key=lambda i: tribe_f[i])
                 parent = tribe_a[best]
 
