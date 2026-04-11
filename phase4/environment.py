@@ -1,17 +1,13 @@
 """
-Phase 4: Grid World Environment
+Phase 4: Grid World Environment with Communication
 """
 
 import numpy as np
 from typing import List, Tuple
 from dataclasses import dataclass
 
-HIDDEN_DIM = 32
-ATT_DIM = 4
-MAX_NEIGHBORS = 8
-OBS_DIM = 16
-ACTION_DIM = 6
-GRID_SIZE = 32
+from .agent import HIDDEN_DIM, ATT_DIM, MAX_NEIGHBORS, OBS_DIM, ACTION_DIM, GRID_SIZE, CommunicationChannel
+
 GRID = GRID_SIZE
 
 FOOD_ENERGY = 30.0
@@ -49,6 +45,9 @@ class World:
         self._spawn_food(30)
         self._spawn_prey()
         self._spawn_predators()
+        
+        # Communication channel
+        self.comm_channel = CommunicationChannel()
 
     def _spawn_food(self, n: int):
         for _ in range(n):
@@ -79,6 +78,9 @@ class World:
             a.prey_captured = 0
             a.age = 0
             a.reset_hidden()
+            a.last_message = None
+            a.messages_sent = 0
+            a.coordination_events = 0
 
     def _periodic_dist(self, ax: float, ay: float, bx: float, by: float) -> float:
         dx = abs(bx - ax); dy = abs(by - ay)
@@ -86,59 +88,103 @@ class World:
         if dy > GRID / 2: dy = GRID - dy
         return dx + dy
 
-    def _build_observations(self) -> List[np.ndarray]:
-        obs_list = []
-        alive = [a for a in self.agents if a.alive]
-        if not alive:
-            return []
-        for agent in alive:
-            obs = np.zeros(OBS_DIM, dtype=np.float32)
-            obs[0] = float(agent.x < 1.0)
-            obs[1] = float(agent.x > GRID - 1.0)
-            obs[2] = float(agent.y < 1.0)
-            obs[3] = float(agent.y > GRID - 1.0)
-            for f in self.foods:
-                d = self._periodic_dist(agent.x, agent.y, f.x, f.y)
-                if d < 3.0:
-                    ddx = f.x - agent.x; ddy = f.y - agent.y
-                    if abs(ddx) > GRID/2: ddx -= np.sign(ddx)*GRID
-                    if abs(ddy) > GRID/2: ddy -= np.sign(ddy)*GRID
-                    norm = max(abs(ddx)+abs(ddy), 1)
-                    for idx, (dd, ii) in enumerate([(ddx, 0), (-ddx, 1), (ddy, 2), (-ddy, 3)]):
-                        obs[4 + ii] = max(obs[4 + ii], dd / norm * (1 - d/3.0))
-            alive_prey = [p for p in self.prey if p.energy > 0]
-            if alive_prey:
-                dists = []
-                for p in alive_prey:
-                    dx = p.x - agent.x; dy = p.y - agent.y
-                    if abs(dx) > GRID/2: dx -= np.sign(dx)*GRID
-                    if abs(dy) > GRID/2: dy -= np.sign(dy)*GRID
-                    dists.append((abs(dx)+abs(dy), dx, dy))
-                _, prdx, prdy = min(dists)
-                norm = max(abs(prdx)+abs(prdy), 1)
-                obs[8] = prdx / norm
-                obs[9] = prdy / norm
-                obs[10] = min(dists)[0] / GRID
-            n_nearby = sum(1 for a in self.agents if a.alive and a.id != agent.id
-                           and self._periodic_dist(agent.x, agent.y, a.x, a.y) < 5.0)
-            obs[11] = min(n_nearby / 10.0, 1.0)
-            n_tribe = sum(1 for a in self.agents if a.alive and a.id != agent.id
-                          and a.tribe_id == agent.tribe_id
-                          and self._periodic_dist(agent.x, agent.y, a.x, a.y) < 5.0)
-            obs[12] = min(n_tribe / 10.0, 1.0)
-            obs[13] = min(agent.age / 200.0, 1.0)
-            tribe_members = [a for a in self.agents if a.alive and a.id != agent.id
-                             and a.tribe_id == agent.tribe_id
-                             and self._periodic_dist(agent.x, agent.y, a.x, a.y) < 5.0]
-            if tribe_members:
-                m = tribe_members[self.rng.randint(len(tribe_members))]
-                ddx = m.x - agent.x; ddy = m.y - agent.y
+    def _build_observation(self, agent) -> np.ndarray:
+        """
+        Build observation for a single agent.
+        Shape: (48,) = 16 original + 32 for messages
+        """
+        obs = np.zeros(OBS_DIM, dtype=np.float32)
+        
+        # --- Original 16 dims ---
+        # Border sensors (0-3)
+        obs[0] = float(agent.x < 1.0)
+        obs[1] = float(agent.x > GRID - 1.0)
+        obs[2] = float(agent.y < 1.0)
+        obs[3] = float(agent.y > GRID - 1.0)
+        
+        # Food direction sensors (4-7)
+        for f in self.foods:
+            d = self._periodic_dist(agent.x, agent.y, f.x, f.y)
+            if d < 3.0:
+                ddx = f.x - agent.x; ddy = f.y - agent.y
                 if abs(ddx) > GRID/2: ddx -= np.sign(ddx)*GRID
                 if abs(ddy) > GRID/2: ddy -= np.sign(ddy)*GRID
                 norm = max(abs(ddx)+abs(ddy), 1)
-                obs[14] = ddx / norm
-                obs[15] = ddy / norm
-            obs_list.append(obs)
+                for idx, (dd, ii) in enumerate([(ddx, 0), (-ddx, 1), (ddy, 2), (-ddy, 3)]):
+                    obs[4 + ii] = max(obs[4 + ii], dd / norm * (1 - d/3.0))
+        
+        # Prey direction (8-10)
+        alive_prey = [p for p in self.prey if p.energy > 0]
+        if alive_prey:
+            dists = []
+            for p in alive_prey:
+                dx = p.x - agent.x; dy = p.y - agent.y
+                if abs(dx) > GRID/2: dx -= np.sign(dx)*GRID
+                if abs(dy) > GRID/2: dy -= np.sign(dy)*GRID
+                dists.append((abs(dx)+abs(dy), dx, dy, p))
+            _, prdx, prdy, nearest_prey = min(dists, key=lambda x: x[0])
+            norm = max(abs(prdx)+abs(prdy), 1)
+            obs[8] = prdx / norm
+            obs[9] = prdy / norm
+            obs[10] = min(dists)[0] / GRID
+        
+        # Nearby agents (11-12)
+        n_nearby = sum(1 for a in self.agents if a.alive and a.id != agent.id
+                       and self._periodic_dist(agent.x, agent.y, a.x, a.y) < 5.0)
+        obs[11] = min(n_nearby / 10.0, 1.0)
+        n_tribe = sum(1 for a in self.agents if a.alive and a.id != agent.id
+                      and a.tribe_id == agent.tribe_id
+                      and self._periodic_dist(agent.x, agent.y, a.x, a.y) < 5.0)
+        obs[12] = min(n_tribe / 10.0, 1.0)
+        
+        # Age (13)
+        obs[13] = min(agent.age / 200.0, 1.0)
+        
+        # Random tribe member direction (14-15)
+        tribe_members = [a for a in self.agents if a.alive and a.id != agent.id
+                         and a.tribe_id == agent.tribe_id
+                         and self._periodic_dist(agent.x, agent.y, a.x, a.y) < 5.0]
+        if tribe_members:
+            m = tribe_members[self.rng.randint(len(tribe_members))]
+            ddx = m.x - agent.x; ddy = m.y - agent.y
+            if abs(ddx) > GRID/2: ddx -= np.sign(ddx)*GRID
+            if abs(ddy) > GRID/2: ddy -= np.sign(ddy)*GRID
+            norm = max(abs(ddx)+abs(ddy), 1)
+            obs[14] = ddx / norm
+            obs[15] = ddy / norm
+        
+        # --- Communication messages (16-47) ---
+        # Receive messages from tribe members
+        msg_summary = self.comm_channel.receive(agent.tribe_id, agent.id, max_messages=8)
+        
+        # Fill in relative positions for message senders
+        if agent.tribe_id in self.comm_channel.messages:
+            msgs = [(sid, msg, pos) for sid, msg, pos in self.comm_channel.messages[agent.tribe_id] 
+                    if sid != agent.id]
+            msgs = msgs[-8:]  # Same messages as in receive()
+            
+            for i, (sender_id, _, (sx, sy)) in enumerate(msgs):
+                if i >= 8:
+                    break
+                # Compute relative position
+                ddx = sx - agent.x; ddy = sy - agent.y
+                if abs(ddx) > GRID/2: ddx -= np.sign(ddx)*GRID
+                if abs(ddy) > GRID/2: ddy -= np.sign(ddy)*GRID
+                norm = max(abs(ddx)+abs(ddy), 1)
+                obs[16 + i*4 + 2] = ddx / norm  # dx to sender
+                obs[16 + i*4 + 3] = ddy / norm  # dy to sender
+        
+        # Copy message stats from msg_summary
+        obs[16:48] = msg_summary
+        
+        return obs
+
+    def _build_observations(self) -> List[np.ndarray]:
+        """Build observations for all alive agents."""
+        obs_list = []
+        alive = [a for a in self.agents if a.alive]
+        for agent in alive:
+            obs_list.append(self._build_observation(agent))
         return obs_list
 
     def _find_neighbors(self, agent) -> Tuple[List[np.ndarray], List[int]]:

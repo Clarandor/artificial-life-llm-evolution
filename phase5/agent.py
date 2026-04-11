@@ -1,23 +1,24 @@
 """
-Phase 4: Recurrent Agent (LSTM) with Communication
-====================================================
-Enhanced with tribe-wide communication channel.
+Phase 5: Recurrent Agent (LSTM) for CoordinationWorld
+======================================================
+Extends Phase 4 with coordination signals (broadcast + receive).
+Action dimension: 7 (added signal broadcast)
+Observation dimension: 20 (added coordination signal channel)
 """
 
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
-
+# ── Shared constants (must match environment.py) ──────────────────────────
 HIDDEN_DIM = 32
 ATT_DIM = 4
 MAX_NEIGHBORS = 8
-OBS_DIM = 48  # Extended: 16 original + 32 for received messages (8 messages × 4 dims each)
-ACTION_DIM = 7  # Extended: +1 for communication trigger
-COMM_DIM = 32   # Communication message dimension
+OBS_DIM = 20        # phase4=16, +4 for coordination signals
+ACTION_DIM = 7      # phase4=6,  +1 for signal broadcast
 GRID_SIZE = 32
 
 
-# ── LSTM Cell ──────────────────────────────────────────────────────────────
+# ── LSTM Cell ─────────────────────────────────────────────────────────────
 
 class LSTMCell:
     def __init__(self, input_dim: int, hidden_dim: int, rng: np.random.RandomState):
@@ -83,10 +84,10 @@ class AttentionQK:
         K = len(h_neighbors)
         if K == 0:
             return np.zeros(self.att_dim, dtype=np.float32), np.array([], dtype=np.float32)
-        
-        q = self.W_q @ h_self  # (att_dim,)
-        k = h_neighbors @ self.W_k.T  # (K, att_dim)
-        scores = (k @ q) / np.sqrt(self.att_dim)  # (K,)
+
+        q = self.W_q @ h_self
+        k = h_neighbors @ self.W_k.T
+        scores = (k @ q) / np.sqrt(self.att_dim)
         weights = self._softmax(scores)
         context = np.tanh(np.einsum('k,kd->d', weights, h_neighbors[:, :self.att_dim]))
         return context.astype(np.float32), weights.astype(np.float32)
@@ -97,171 +98,105 @@ class AttentionQK:
         return exp / (exp.sum() + 1e-10)
 
 
-# ── Communication Channel ─────────────────────────────────────────────────
-
-class CommunicationChannel:
-    """Manages tribe-wide message broadcasting."""
-    
-    def __init__(self):
-        # tribe_id -> list of (sender_id, message_vector, sender_pos)
-        self.messages: dict = {}
-    
-    def clear(self):
-        """Clear all messages at start of each step."""
-        self.messages = {}
-    
-    def broadcast(self, tribe_id: int, sender_id: int, message: np.ndarray, sender_pos: Tuple[float, float]):
-        """Broadcast a message to all tribe members."""
-        if tribe_id not in self.messages:
-            self.messages[tribe_id] = []
-        self.messages[tribe_id].append((sender_id, message.copy(), sender_pos))
-    
-    def receive(self, tribe_id: int, receiver_id: int, max_messages: int = 8) -> np.ndarray:
-        """
-        Receive messages from tribe members.
-        Returns a flat vector of shape (max_messages * 4,) containing message summaries.
-        Each message is compressed to 4 dims: [msg_mean, msg_std, dx, dy]
-        """
-        result = np.zeros(max_messages * 4, dtype=np.float32)
-        
-        if tribe_id not in self.messages:
-            return result
-        
-        # Get messages from other tribe members (not self)
-        msgs = [(sid, msg, pos) for sid, msg, pos in self.messages[tribe_id] if sid != receiver_id]
-        
-        if not msgs:
-            return result
-        
-        # Take up to max_messages most recent
-        msgs = msgs[-max_messages:]
-        
-        for i, (sender_id, msg, (sx, sy)) in enumerate(msgs):
-            if i >= max_messages:
-                break
-            # Compress 32-dim message to 4 dims
-            result[i * 4 + 0] = np.mean(msg)  # Message mean
-            result[i * 4 + 1] = np.std(msg)   # Message std
-            # Note: dx, dy will be filled by the receiver with relative position
-            result[i * 4 + 2] = 0.0  # placeholder for dx
-            result[i * 4 + 3] = 0.0  # placeholder for dy
-        
-        return result
-
-
-# ── Agent ────────────────────────────────────────────────────────────────
+# ── Agent ─────────────────────────────────────────────────────────────────
 
 class Agent:
-    """LSTM agent with attention and communication capabilities."""
-    
+    """
+    LSTM agent with attention for CoordinationWorld.
+    Extends Phase 4 agent with coordination signal output (ACTION_DIM=7).
+    The 7th action controls signal broadcast (0 = no signal, 1..4 = signal types).
+    """
+
     _next_id = 0
-    
+
     def __init__(self, tribe_id: int, rng: np.random.RandomState, tribe_templates: dict = None):
         self.id = Agent._next_id
         Agent._next_id += 1
         self.tribe_id = tribe_id
-        
+
         if tribe_templates is not None:
-            # Share LSTM/Attention templates within tribe
             lstm_t = tribe_templates[tribe_id]['lstm']
             attn_t = tribe_templates[tribe_id]['attn']
         else:
-            # Create new
             lstm_t = LSTMCell(OBS_DIM, HIDDEN_DIM, rng)
             attn_t = AttentionQK(HIDDEN_DIM, ATT_DIM, rng)
-        
+
         self.lstm = lstm_t
         self.attn = attn_t
-        
+
         # Decoder: concat(h, ctx) -> hidden_dim
         self.dec_W = rng.normal(0, 0.01, (HIDDEN_DIM, HIDDEN_DIM + ATT_DIM)).astype(np.float32)
         self.dec_b = rng.normal(0, 0.01, (HIDDEN_DIM,)).astype(np.float32)
-        # Action head (now 7 dims)
+        # Action head: 7 outputs (was 6)
         self.act_W = rng.normal(0, 0.01, (ACTION_DIM, HIDDEN_DIM)).astype(np.float32)
         self.act_b = rng.normal(0, 0.01, (ACTION_DIM,)).astype(np.float32)
-        
-        # Communication head: hidden_dim -> COMM_DIM
-        self.comm_W = rng.normal(0, 0.01, (COMM_DIM, HIDDEN_DIM)).astype(np.float32)
-        self.comm_b = rng.normal(0, 0.01, (COMM_DIM,)).astype(np.float32)
-        
+
         self.x = rng.uniform(0, GRID_SIZE)
         self.y = rng.uniform(0, GRID_SIZE)
         self.energy = 200.0
         self.alive = True
         self.food_collected = 0.0
-        self.prey_captured = 0
+        self.small_prey_captured = 0
+        self.large_prey_captured = 0
+        self.attacks_made = 0        # tracks large-prey attack attempts
+        self.signals_sent = 0        # coordination signals broadcast
+        self.signals_received = 0    # coordination signals received
         self.age = 0
-        
+
+        # Current action state (used to encode what to broadcast)
+        self._current_signal = 0
+        self._signal_target = (0.0, 0.0)
+
         # LSTM state
         self.h = np.zeros(HIDDEN_DIM, dtype=np.float32)
         self.c = np.zeros(HIDDEN_DIM, dtype=np.float32)
-        
-        # Communication state
-        self.last_message: Optional[np.ndarray] = None
-        self.messages_sent = 0
-        self.coordination_events = 0  # Track cooperative hunting
-    
+
     @property
     def hidden(self) -> np.ndarray:
         return self.h
-    
+
     def reset_hidden(self):
         self.h = np.zeros(HIDDEN_DIM, dtype=np.float32)
         self.c = np.zeros(HIDDEN_DIM, dtype=np.float32)
-    
+
     def encode(self, obs: np.ndarray):
-        """Encode observation through LSTM."""
         self.h, self.c = self.lstm.forward(obs.astype(np.float32), self.h, self.c)
-    
-    def generate_message(self) -> np.ndarray:
-        """Generate a 32-dim communication message from hidden state."""
-        msg = np.tanh(self.comm_W @ self.h + self.comm_b)
-        return msg.astype(np.float32)
-    
-    def decide(self, neighbor_hiddens: List[np.ndarray], received_messages: np.ndarray = None) -> np.ndarray:
+
+    def decide(self, neighbor_hiddens: List[np.ndarray]) -> np.ndarray:
         """
-        Make decision based on hidden state, neighbor attention, and received messages.
-        
-        Args:
-            neighbor_hiddens: Hidden states of nearby neighbors
-            received_messages: Flat vector of received message summaries (max_messages * 4)
-        
-        Returns:
-            Action vector of shape (7,): [dx, dy, speed_mod, eat, hunt, comm_trigger, unused]
+        Decide action based on hidden state and neighbor context.
+
+        Returns action vector (ACTION_DIM=7):
+          [0]  dx        : movement x (-1..1)
+          [1]  dy        : movement y (-1..1)
+          [2]  speed     : movement speed (0..1)
+          [3]  eat_food  : try to eat food at current location (>0 triggers)
+          [4]  attack_small : try to capture small prey (>0 triggers)
+          [5]  attack_large : try to attack large prey (>0 triggers)
+          [6]  broadcast    : signal broadcast (>0 triggers, value maps to signal type)
         """
-        # Attention over neighbors
         ctx, _ = self.attn.attend(self.h, neighbor_hiddens)
-        
-        # Decode
         dec_in = np.concatenate([self.h, ctx])
         decoded = np.tanh(self.dec_W @ dec_in + self.dec_b)
-        
-        # Action
-        action = self.act_W @ decoded + self.act_b
-        
-        # Process received messages (already integrated into observation)
-        # This is handled in build_observation, not here
-        
+        raw = self.act_W @ decoded + self.act_b
+
         return np.array([
-            np.clip(action[0], -1, 1),      # dx
-            np.clip(action[1], -1, 1),      # dy
-            np.clip(action[2], 0, 1),       # speed modifier
-            float(action[3] > 0),           # eat action
-            float(action[4] > 0),           # hunt action
-            float(action[5] > 0),           # communication trigger
-            float(action[6]),               # reserved (unused for now)
+            np.clip(raw[0], -1, 1),
+            np.clip(raw[1], -1, 1),
+            np.clip(raw[2], 0, 1),
+            float(raw[3] > 0),
+            float(raw[4] > 0),
+            float(raw[5] > 0),
+            float(np.clip(raw[6], 0, 4)),  # signal broadcast 0..4 (0=no signal, 1-4=type)
         ], dtype=np.float32)
-    
-    def set_weights(self, lstm_p, attn_p, dec_p, act_p, comm_p=None):
+
+    def set_weights(self, lstm_p, attn_p, dec_p, act_p):
         self.lstm.set_params(lstm_p)
         self.attn.set_params(attn_p)
         self.dec_W = dec_p[:-HIDDEN_DIM].reshape(HIDDEN_DIM, HIDDEN_DIM + ATT_DIM)
         self.dec_b = dec_p[-HIDDEN_DIM:]
         self.act_W = act_p[:-ACTION_DIM].reshape(ACTION_DIM, HIDDEN_DIM)
         self.act_b = act_p[-ACTION_DIM:]
-        if comm_p is not None:
-            self.comm_W = comm_p[:-COMM_DIM].reshape(COMM_DIM, HIDDEN_DIM)
-            self.comm_b = comm_p[-COMM_DIM:]
 
     def clone_weights_from(self, other: 'Agent'):
         """Copy weights from another agent."""
@@ -271,9 +206,7 @@ class Agent:
         self.dec_b = other.dec_b.copy()
         self.act_W = other.act_W.copy()
         self.act_b = other.act_b.copy()
-        self.comm_W = other.comm_W.copy()
-        self.comm_b = other.comm_b.copy()
-    
+
     @staticmethod
     def count_params() -> dict:
         rng = np.random.RandomState(0)
@@ -281,11 +214,9 @@ class Agent:
         attn = AttentionQK(HIDDEN_DIM, ATT_DIM, rng)
         dec = rng.normal(0, 0.01, (HIDDEN_DIM, HIDDEN_DIM + ATT_DIM))
         act = rng.normal(0, 0.01, (ACTION_DIM, HIDDEN_DIM))
-        comm = rng.normal(0, 0.01, (COMM_DIM, HIDDEN_DIM))
         return {
             "lstm": lstm.num_params,
             "attn": attn.num_params,
             "decoder": dec.size + HIDDEN_DIM,
             "action": act.size + ACTION_DIM,
-            "communication": comm.size + COMM_DIM,
         }

@@ -1,6 +1,7 @@
 """
-Phase 4: Evolution Engine for LSTM Agents
-==========================================
+Phase 4: Evolution Engine for LSTM Agents with Communication
+=============================================================
+Enhanced with coordination rewards for cooperative hunting.
 """
 
 import numpy as np
@@ -9,7 +10,7 @@ import json
 import os
 from typing import List
 
-from .agent import HIDDEN_DIM, ATT_DIM, GRID_SIZE, Agent
+from .agent import HIDDEN_DIM, ATT_DIM, GRID_SIZE, COMM_DIM, Agent
 from .environment import World
 
 
@@ -59,6 +60,10 @@ class Evolution:
     N_TRIBES = 10
     TRIBE_SIZE = 10
     
+    # Coordination reward parameters
+    COORDINATION_RADIUS = 6.0  # Distance for cooperative hunting
+    COORDINATION_REWARD = 2.0  # Base reward for coordinated behavior
+    
     def __init__(self, seed: int = 42):
         self.rng = np.random.RandomState(seed)
         self.world = World(seed=seed)
@@ -71,7 +76,7 @@ class Evolution:
         for t in range(self.N_TRIBES):
             rng_t = np.random.RandomState(seed + t)
             self.tribe_templates[t] = {
-                'lstm': LSTMCell(16, HIDDEN_DIM, rng_t),
+                'lstm': LSTMCell(48, HIDDEN_DIM, rng_t),  # OBS_DIM = 48
                 'attn': AttentionQK(HIDDEN_DIM, ATT_DIM, rng_t),
             }
         
@@ -85,12 +90,63 @@ class Evolution:
         total = sum(counts.values())
         self.N_PARAMS = total
         
-        Agent._next_id = len(self.agents)  # reset ID counter
+        Agent._next_id = len(self.agents)
         self.generation_log: List[dict] = []
         
-        print(f"  Architecture: LSTM({HIDDEN_DIM}) + Attention({ATT_DIM})")
-        print(f"  Params: lstm={counts['lstm']} attn={counts['attn']} dec={counts['decoder']} act={counts['action']} total={total}")
+        # Track coordination events
+        self.coordination_events_total = 0
+        
+        print(f"  Architecture: LSTM({HIDDEN_DIM}) + Attention({ATT_DIM}) + Comm({COMM_DIM})")
+        print(f"  Obs dim: 48 (16 base + 32 messages)")
+        print(f"  Action dim: 7 (6 base + 1 comm trigger)")
+        print(f"  Params: lstm={counts['lstm']} attn={counts['attn']} dec={counts['decoder']} "
+              f"act={counts['action']} comm={counts['communication']} total={total}")
         print(f"  ATTN_LOSS_WEIGHT: {self.ATTN_LOSS_WEIGHT}")
+        print(f"  COORDINATION_REWARD: {self.COORDINATION_REWARD}")
+
+    def _compute_coordination_reward(self, agents: List[Agent]) -> dict:
+        """
+        Compute coordination rewards for tribe members.
+        
+        Coordination is measured by:
+        1. Tribe members near same prey (potential cooperative hunting)
+        2. Messages sent during hunting opportunities
+        3. Proximity coordination (moving together)
+        """
+        rewards = {a.id: 0.0 for a in agents if a.alive}
+        coordination_events = 0
+        
+        alive_agents = [a for a in agents if a.alive]
+        alive_prey = [p for p in self.world.prey if p.energy > 0]
+        
+        for prey in alive_prey:
+            # Find agents near this prey
+            nearby_tribe_agents = {}
+            for a in alive_agents:
+                dist = self.world._periodic_dist(a.x, a.y, prey.x, prey.y)
+                if dist < self.COORDINATION_RADIUS:
+                    if a.tribe_id not in nearby_tribe_agents:
+                        nearby_tribe_agents[a.tribe_id] = []
+                    nearby_tribe_agents[a.tribe_id].append(a)
+            
+            # Reward coordinated hunting (2+ tribe members near same prey)
+            for tribe_id, tribe_members in nearby_tribe_agents.items():
+                if len(tribe_members) >= 2:
+                    coordination_events += 1
+                    for a in tribe_members:
+                        # Higher reward for more coordinated agents
+                        rewards[a.id] += self.COORDINATION_REWARD * len(tribe_members) / 2.0
+                        a.coordination_events += 1
+        
+        # Bonus for agents that sent messages while near prey
+        for a in alive_agents:
+            if a.messages_sent > 0:
+                for prey in alive_prey:
+                    dist = self.world._periodic_dist(a.x, a.y, prey.x, prey.y)
+                    if dist < self.COORDINATION_RADIUS:
+                        rewards[a.id] += 0.5  # Small bonus for communicating near prey
+        
+        return {"rewards": rewards, "events": coordination_events}
 
     def _breed(self, agents: List[Agent], fitnesses: np.ndarray, gen: int, total_gens: int) -> List[Agent]:
         """Intra-tribe tournament selection + mutation."""
@@ -123,6 +179,7 @@ class Evolution:
                     (child.attn.W_q, 0.1), (child.attn.W_k, 0.1),
                     (child.dec_W, 0.1), (child.dec_b, 0.1),
                     (child.act_W, 0.1), (child.act_b, 0.1),
+                    (child.comm_W, 0.1), (child.comm_b, 0.1),  # Also mutate communication
                 ]:
                     mask = self.rng.uniform(0, 1, attr.size) < frac
                     noise = self.rng.normal(0, sigma, mask.sum())
@@ -148,11 +205,15 @@ class Evolution:
             # ── Simulate ──
             attn_losses = []
             attn_weights_list = []
+            messages_sent_this_gen = 0
             
             for step in range(self.STEPS_PER_GEN):
                 agents = self.world.agents
                 if not any(a.alive for a in agents):
                     break
+                
+                # Clear communication channel at start of step
+                self.world.comm_channel.clear()
                 
                 # Encode observations through LSTM
                 obs_list = self.world._build_observations()
@@ -165,9 +226,28 @@ class Evolution:
                 for i, agent in enumerate(alive_agents[:len(obs_list)]):
                     agent.encode(obs_list[i])
                 
-                # Attention + decisions
+                # First pass: generate and broadcast messages
+                for agent in alive_agents:
+                    # Generate potential message
+                    message = agent.generate_message()
+                    
+                    # Decision (without messages for now, they're in obs)
+                    nh_h, nh_ids = self.world._find_neighbors(agent)
+                    action = agent.decide(nh_h)
+                    
+                    # Broadcast if communication action triggered
+                    if action[5] > 0:  # Communication trigger
+                        self.world.comm_channel.broadcast(
+                            agent.tribe_id, agent.id, message, (agent.x, agent.y)
+                        )
+                        agent.last_message = message
+                        agent.messages_sent += 1
+                        messages_sent_this_gen += 1
+                
+                # Second pass: execute actions
                 for agent in alive_agents:
                     nh_h, nh_ids = self.world._find_neighbors(agent)
+                    action = agent.decide(nh_h)
                     
                     # Attention supervision
                     if nh_h:
@@ -193,9 +273,6 @@ class Evolution:
                                 kl = np.sum(target * np.log(target / (aw + 1e-10) + 1e-10))
                                 attn_losses.append(kl)
                                 attn_weights_list.append(aw)
-                    
-                    # Decision
-                    action = agent.decide(nh_h)
                     
                     # Move
                     speed = 0.5 + 0.5 * action[2]
@@ -238,9 +315,18 @@ class Evolution:
             agents = self.world.agents
             alive = [a for a in agents if a.alive]
             
+            # Compute coordination rewards
+            coord_result = self._compute_coordination_reward(alive)
+            coord_rewards = coord_result["rewards"]
+            coord_events = coord_result["events"]
+            self.coordination_events_total += coord_events
+            
             raw_food = np.array([a.food_collected for a in alive], dtype=np.float32)
             prey_caps = np.array([a.prey_captured for a in alive], dtype=np.float32)
             raw_fit = raw_food + prey_caps * 3.0
+            
+            # Add coordination rewards
+            coord_fit = np.array([coord_rewards.get(a.id, 0.0) for a in alive], dtype=np.float32)
             
             total_prey = int(prey_caps.sum())
             
@@ -251,12 +337,17 @@ class Evolution:
             mean_attn_entropy = np.mean(attn_ents) if attn_ents else 0.0
             mean_attn_loss = np.mean(attn_losses) if attn_losses else 0.0
             
-            fitnesses = raw_fit + self.ATTN_LOSS_WEIGHT * mean_attn_loss
+            # Combined fitness
+            fitnesses = raw_fit + coord_fit + self.ATTN_LOSS_WEIGHT * mean_attn_loss
             if len(fitnesses) > 0:
                 fitnesses = fitnesses - fitnesses.min() + 1e-8
             
             # Sample hiddens
             sample_h = np.stack([a.h for a in alive[:50]]) if alive else None
+            
+            # Communication stats
+            total_messages = sum(a.messages_sent for a in alive)
+            avg_coord_events = np.mean([a.coordination_events for a in alive]) if alive else 0.0
             
             log = {
                 "generation": gen,
@@ -267,6 +358,11 @@ class Evolution:
                 "mean_raw_food": float(raw_food.mean()) if len(raw_food) else 0.0,
                 "mean_prey_cap": float(prey_caps.mean()) if len(prey_caps) else 0.0,
                 "total_prey_caps": total_prey,
+                "mean_coord_reward": float(coord_fit.mean()) if len(coord_fit) else 0.0,
+                "coord_events": coord_events,
+                "total_coord_events": self.coordination_events_total,
+                "messages_sent": messages_sent_this_gen,
+                "total_messages": total_messages,
                 "mean_attn_entropy": float(mean_attn_entropy),
                 "mean_attn_loss": float(mean_attn_loss),
                 "elapsed_sec": round(time.time() - t0, 2),
@@ -279,7 +375,8 @@ class Evolution:
                 sigma = self.MUTATION_SIGMA * (1 - 0.8 * gen / generations)
                 print(f"Gen {gen:4d} | pop={len(alive):3d} | "
                       f"fit μ={fitnesses.mean():.2f} raw={raw_fit.mean():.2f} | "
-                      f"prey={total_prey:3d} | H={mean_attn_entropy:.3f} | "
+                      f"prey={total_prey:3d} | coord={coord_events:3d} | "
+                      f"msg={messages_sent_this_gen:4d} | H={mean_attn_entropy:.3f} | "
                       f"σ={sigma:.4f} | ⏱ {elapsed:.0f}s")
             
             # ── Breed ──
@@ -293,6 +390,9 @@ class Evolution:
                 a.prey_captured = 0
                 a.age = 0
                 a.reset_hidden()
+                a.last_message = None
+                a.messages_sent = 0
+                a.coordination_events = 0
         
         if save_log:
             os.makedirs("results/phase4", exist_ok=True)
